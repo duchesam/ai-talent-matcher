@@ -1,94 +1,75 @@
 import os
 import json
-import requests
 from flask import Flask, request, jsonify
 from openai import OpenAI
+from pyairtable import Api
 
 app = Flask(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Candidates")
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+airtable_api = Api(os.environ.get("AIRTABLE_API_KEY"))
+table = airtable_api.table(
+    os.environ.get("AIRTABLE_BASE_ID"), 
+    os.environ.get("AIRTABLE_TABLE_NAME")
+)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+@app.route('/webhook/call-completed', methods=['POST'])
+def webhook():
+    data = request.get_json() or {}
+    print("--- INCOMING WEBHOOK ---")
+    print(json.dumps(data, indent=2))
 
-SYSTEM_EVALUATION_PROMPT = """
-You are an expert technical interviewer evaluating a candidate's transcript.
-Analyze the transcript against this rubric:
-1. Technical Depth (35%): Architectural mastery, tool choices, edge case awareness.
-2. Problem Solving (30%): Systems thinking, scalability, cost trade-offs.
-3. Project Ownership (20%): Leadership, decision autonomy, business impact metrics.
-4. Communication (15%): Clarity, conciseness, non-technical translation.
-
-Output ONLY valid JSON matching this schema:
-{
-  "candidate_id": "STRING",
-  "overall_score": FLOAT,
-  "match_recommendation": "STRONG_HIRE" | "HIRE" | "NEUTRAL" | "REJECT",
-  "executive_summary": "STRING",
-  "scores": {
-    "technical_depth": {"score": INT, "reasoning": "STRING"},
-    "problem_solving": {"score": INT, "reasoning": "STRING"},
-    "project_ownership": {"score": INT, "reasoning": "STRING"},
-    "communication": {"score": INT, "reasoning": "STRING"}
-  },
-  "extracted_skills": ["STRING"],
-  "key_quotes": ["STRING"]
-}
-"""
-
-@app.route("/webhook/call-completed", methods=["POST"])
-def handle_call_completed():
-    data = request.get_json()
-    call_data = data.get("message", data)
-    transcript = call_data.get("transcript", "")
-    candidate_phone = call_data.get("customer", {}).get("number", "N/A")
-    call_id = call_data.get("id", "UNKNOWN_CALL")
-
-    if not transcript:
-        return jsonify({"status": "ignored", "reason": "empty transcript"}), 200
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_EVALUATION_PROMPT},
-            {"role": "user", "content": f"Candidate Phone: {candidate_phone}\nTranscript:\n{transcript}"}
-        ],
-        temperature=0.2
-    )
-
-    eval_result = json.loads(response.choices[0].message.content)
-
-    airtable_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
-    headers = {
-        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    call_data = data.get("call", {})
+    transcript = call_data.get("transcript") or data.get("transcript")
     
-    payload = {
-        "records": [
-            {
-                "fields": {
-                    "Candidate ID": eval_result.get("candidate_id", call_id),
-                    "Phone": candidate_phone,
-                    "Overall Score": eval_result.get("overall_score"),
-                    "Recommendation": eval_result.get("match_recommendation"),
-                    "Executive Summary": eval_result.get("executive_summary"),
-                    "Technical Depth Score": eval_result["scores"]["technical_depth"]["score"],
-                    "Problem Solving Score": eval_result["scores"]["problem_solving"]["score"],
-                    "Ownership Score": eval_result["scores"]["project_ownership"]["score"],
-                    "Communication Score": eval_result["scores"]["communication"]["score"],
-                    "Skills": ", ".join(eval_result.get("extracted_skills", [])),
-                    "Transcript": transcript
-                }
-            }
-        ]
-    }
+    if not transcript:
+        print("No transcript found in payload. Skipping Airtable write.")
+        return jsonify({"status": "ignored_no_transcript"}), 200
 
-    airtable_res = requests.post(airtable_url, headers=headers, json=payload)
-    return jsonify({"status": "success", "airtable_id": airtable_res.json()}), 200
+    print("Extracting insights with OpenAI...")
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an AI technical recruiter evaluating a candidate transcript. "
+                        "Return ONLY a JSON object with these exact keys:\n"
+                        "- Candidate ID: string (generate short ID like CAND-101 or extract name)\n"
+                        "- Phone: string or null\n"
+                        "- Overall Score: integer from 1 to 100\n"
+                        "- Recommendation: string (Strong Hire, Hire, Consider, or Reject)\n"
+                        "- Executive Summary: string (2-3 sentences summarising candidate fit)\n"
+                        "- Technical Depth: string (detailed assessment of technical skills)"
+                    )
+                },
+                {"role": "user", "content": f"Transcript:\n{transcript}"}
+            ],
+            response_format={"type": "json_object"}
+        )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+        extracted_data = json.loads(response.choices[0].message.content)
+        print("OpenAI Output:", extracted_data)
+
+        record = {
+            "Candidate ID": str(extracted_data.get("Candidate ID", "CAND-001")),
+            "Phone": str(call_data.get("from_number", "N/A")),
+            "Overall Score": int(extracted_data.get("Overall Score", 75)),
+            "Recommendation": str(extracted_data.get("Recommendation", "Consider")),
+            "Executive Summary": str(extracted_data.get("Executive Summary", "")),
+            "Technical Depth": str(extracted_data.get("Technical Depth", ""))
+        }
+
+        print("Writing record to Airtable...")
+        created = table.create(record)
+        print("Successfully created Airtable record:", created["id"])
+
+        return jsonify({"status": "success", "airtable_id": created["id"]}), 200
+
+    except Exception as e:
+        print("ERROR processing call:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
